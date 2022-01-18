@@ -4,11 +4,14 @@
 # In[1]:
 
 
-from pydecentscale import DecentScale
+from pydecentscale.pydecentscale import DecentScale
 import asyncio
 import nest_asyncio
 nest_asyncio.apply()
 import time
+import logging
+
+logging.basicConfig(level='DEBUG')
 
 
 # In[2]:

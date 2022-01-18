@@ -2,6 +2,10 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2021 Luca Pinello
 # Released under GPLv3
+"""
+Implementation of the Decent Scale API
+see also https://decentespresso.com/decentscale_api
+"""
 
 __version__ = "0.1.0"
 
@@ -17,6 +21,9 @@ from itertools import cycle
 from bleak import BleakScanner, BleakClient
 
 logger = logging.getLogger(__name__)
+
+
+FIRMWARE_VERSION = {0xFE: 'v1.0', 0x02: 'v1.1'}
 
 
 class AsyncioEventLoopThread(threading.Thread):
@@ -52,9 +59,10 @@ class DecentScale(AsyncioEventLoopThread):
         self.connected=False
         self.fix_dropped_command=fix_dropped_command
         self.dropped_command_sleep = 0.05  # API Docs says 50ms
-        self.weight = None   
+        self.weight = None
 
-         
+        self.button_callbacks = []
+
         #Constants
         self.CHAR_READ='0000FFF4-0000-1000-8000-00805F9B34FB'
         self.CHAR_WRITE='000036f5-0000-1000-8000-00805f9b34fb'
@@ -66,7 +74,9 @@ class DecentScale(AsyncioEventLoopThread):
         
         tare_commands=[  bytearray.fromhex(c) for c in ['030F000000000C','030F010000000D','030F020000000E']]
         self.tare_commands=cycle(tare_commands)
-                
+
+        # NOTE: LED_ON is Weight LED, Timer LED, Units (since v1.1)
+        # here, we send always both leds on and units == g
         self.led_on_command=bytearray.fromhex('030A0101000009')
         self.led_off_command=bytearray.fromhex('030A0000000009')
         self.start_time_command=bytearray.fromhex('030B030000000B')
@@ -74,7 +84,7 @@ class DecentScale(AsyncioEventLoopThread):
         self.reset_time_command=bytearray.fromhex("030B020000000A" )
         
         super().start()
-        
+
     def check_connection(func):
         def is_connected(self):
             if self.connected:
@@ -141,6 +151,8 @@ class DecentScale(AsyncioEventLoopThread):
         await self.__send(self.reset_time_command)
 
     def notification_handler(self, sender, data):
+        logger.debug(f"Received Notification at {time.time():.3f}: {binascii.hexlify(data, sep=':').decode('ascii')!r}")
+
         if data[0] != 0x03 or len(data) != 7:
             # Basic sanity check
             logger.info("Invalid notification: not a Decent Scale?")
@@ -149,10 +161,8 @@ class DecentScale(AsyncioEventLoopThread):
         # Calculate XOR
         xor_msg = functools.reduce(operator.xor, data[:-1])
         if xor_msg != data[-1]:
-            logger.warning("XOR verification failed for notification")
+            logger.warning("XOR validation failed for notification")
             return
-
-        logger.debug(f"Received Notification at {time.time()}: {binascii.hexlify(data, sep=':')}")
 
         # Have to decide by type of the package
         type_ = data[1]
@@ -164,12 +174,24 @@ class DecentScale(AsyncioEventLoopThread):
             # Button press
             # NOTE: Despite the API documentation saying the XOR field is 0x00, it actually contains the XOR
             logger.debug(f"Button press: {data[2]}, duration: {data[3]}")
+            # FIXME: This is not good. it crashes the event loop!
+            self._handle_buttons(data[2], data[3])
         elif type_ == 0x0F:
             # tare increment
             pass
         elif type_ == 0x0A:
             # LED on/off -> returns units and battery level
-            logger.debug(f"Unit of scale: {'g' if data[3] == 0 else 'oz'}, battery level: {data[4]}%")
+            logger.debug(f"Unit of scale: {'g' if data[3] == 0 else 'oz'}")
+            if data[4] <= 0x64:
+                logger.debug(f"battery level: {data[4]}%")
+            elif data[4] == 0xff:
+                logger.debug("Scale is running on USB power")
+            else:
+                logger.warning(f"Unknown battery level: 0x{data[4]:02x}")
+            if data[5] in FIRMWARE_VERSION:
+                logger.debug(f"Firmware Version: {FIRMWARE_VERSION[data[5]]}")
+            else:
+                logger.warning(f"Firmware Version is not known: 0x{data[5]:02x}")
         elif type_ == 0x0B:
             # Timer
             # NOTE: The API documentation says there is a section on "Receiving Timer Info" but this is missing
@@ -177,11 +199,22 @@ class DecentScale(AsyncioEventLoopThread):
         else:
             logger.warning(f"Unknown Notification Type received: 0x{type_:02x}")
 
+    def _handle_buttons(self, button, duration):
+        for callback in self.button_callbacks:
+            callback(self, button, duration)
+
     async def _enable_notification(self):
         await self.client.start_notify(self.CHAR_READ, self.notification_handler)
         await asyncio.sleep(1)
-        
-             
+
+    def add_button_handler(self, callback):
+        """
+        Register a button handler function
+        The function must have the following signature:
+        function(scale: DecentScale, button: int, duration: int)
+        """
+        self.button_callbacks.append(callback)
+
     async def _disable_notification(self):
         await self.client.stop_notify(self.CHAR_READ) 
 
